@@ -393,7 +393,7 @@ def get_folder_size(folder_path: Path) -> int:
     return total
 
 
-def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str]:
+def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str, str]:
     """
     Extract archive with automatic fallback to CLI tools on errors.
 
@@ -402,7 +402,7 @@ def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str]:
     2. On ANY failure, immediately fall back to CLI tools
     3. CLI tools handle encoding issues gracefully via errors='replace'
 
-    Returns (success, error_message).
+    Returns (success, extracted_folder, error_message).
     """
     ext = archive_path.suffix.lower()
     library_error = None
@@ -411,16 +411,19 @@ def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str]:
     try:
         if ext == ".zip":
             with zipfile.ZipFile(archive_path, 'r') as zf:
+                first_extracted_member = zf.namelist()[0] if zf.namelist() else ""
                 zf.extractall(dest_folder)
-            return True, ""
+            return True, first_extracted_member, ""
         elif ext == ".7z" and HAS_7Z:
             with py7zr.SevenZipFile(archive_path, 'r') as sz:
+                first_extracted_member = sz.getnames()[0] if sz.getnames() else ""
                 sz.extractall(dest_folder)
-            return True, ""
+            return True, first_extracted_member, ""
         elif ext == ".rar" and HAS_RAR_LIB:
             with unrar_rarfile.RarFile(str(archive_path)) as rf:
+                first_extracted_member = rf.namelist()[0] if rf.namelist() else ""
                 rf.extractall(str(dest_folder))
-            return True, ""
+            return True, first_extracted_member, ""
     except Exception as e:
         library_error = str(e)
         # Fall through to CLI fallback
@@ -428,24 +431,23 @@ def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str]:
     # CLI fallback (handles encoding issues gracefully)
     cli_success, cli_error = _extract_with_cli(archive_path, dest_folder)
     if cli_success:
-        return True, ""
+        return True, "",""
 
     # Both failed - check if we have any CLI tools available
     if not UNIVERSAL_CLI_TOOL and not UNRAR_CLI:
         # No CLI tools - provide platform-specific install guidance
         if os.name == 'nt':
-            return False, "Install 7-Zip from https://7-zip.org and add to PATH"
+            return False, "", "Install 7-Zip from https://7-zip.org and add to PATH"
         elif sys.platform == 'darwin':
-            return False, "Install unar: brew install unar"
+            return False, "", "Install unar: brew install unar"
         else:
-            return False, "Install p7zip: sudo apt install p7zip-full"
-
+            return False, "", "Install p7zip: sudo apt install p7zip-full"
     # CLI was available but failed - return most useful error
     if cli_error and cli_error != "No CLI extraction tool available":
-        return False, cli_error
+        return False, "", cli_error
     if library_error:
-        return False, library_error
-    return False, f"Failed to extract {ext} archive"
+        return False, "", library_error
+    return False, "", f"Failed to extract {ext} archive"
 
 
 def delete_video_files(folder_path: Path) -> int:
@@ -851,8 +853,12 @@ class FileDownloader:
 
             # Get display name (strip _download_ prefix if present)
             display_name = task.local_path.name
+
             if display_name.startswith("_download_"):
                 display_name = display_name[10:]
+            else:
+                # Include song folder name for non-archive files
+                display_name = task.local_path.parent.name + "/" + display_name
 
             with open(task.local_path, "wb") as f:
                 async for chunk in response.content.iter_chunked(self.chunk_size):
@@ -867,10 +873,8 @@ class FileDownloader:
                             if elapsed >= time_threshold and now - last_progress_time >= progress_interval:
                                 last_progress_time = now
                                 progress_shown = True
-                                pct = (downloaded_bytes / total_size * 100) if total_size > 0 else 0
-                                size_mb = downloaded_bytes / (1024 * 1024)
-                                total_mb = total_size / (1024 * 1024)
-                                progress_tracker.write(f"  ↓ {display_name}: {size_mb:.0f}/{total_mb:.0f} MB ({pct:.0f}%)")
+                                
+                                progress_tracker.display_update(display_name, downloaded_bytes, total_size)
 
         return DownloadResult(
             success=True,
@@ -879,7 +883,7 @@ class FileDownloader:
             bytes_downloaded=downloaded_bytes,
         )
 
-    def process_archive(self, task: DownloadTask) -> Tuple[bool, str]:
+    def process_archive(self, task: DownloadTask) -> Tuple[bool, str, str]:
         """
         Process a downloaded archive: extract, write checksum, delete videos, cleanup.
 
@@ -887,20 +891,19 @@ class FileDownloader:
             task: The completed DownloadTask (is_archive should be True)
 
         Returns:
-            (success, error_message)
+            (success, display_archive_name, error_message)
         """
         archive_path = task.local_path
         chart_folder = archive_path.parent
 
         # Determine extracted folder name (archive name without extension)
-        archive_name = archive_path.name.replace("_download_", "", 1)
-        archive_stem = Path(archive_name).stem
-        extracted_folder = chart_folder / archive_stem
+        original_archive_name = archive_path.name.replace("_download_", "", 1)
+        archive_stem = Path(original_archive_name).stem
 
         # Rename archive to remove _download_ prefix BEFORE extraction
         # This ensures unar/7z create folders with the correct name
         if archive_path.name.startswith("_download_"):
-            clean_archive_path = chart_folder / archive_name
+            clean_archive_path = chart_folder / original_archive_name
             try:
                 archive_path.rename(clean_archive_path)
                 archive_path = clean_archive_path
@@ -914,9 +917,18 @@ class FileDownloader:
         size_before = get_folder_size(chart_folder)
 
         # Extract archive
-        success, error = extract_archive(archive_path, chart_folder)
+        success, extracted_folder_name, error = extract_archive(archive_path, chart_folder)
         if not success:
-            return False, f"Extract failed: {error}"
+            return False, display_archive_name, f"Extract failed: {error}"
+        
+        # Determine extracted folder path
+        if extracted_folder_name:
+            archive_stem = extracted_folder_name
+            display_archive_name = f"{extracted_folder_name} - {original_archive_name}"
+        else:
+            display_archive_name = original_archive_name
+
+        extracted_folder = chart_folder / archive_stem
 
         # Measure size AFTER extraction (before video removal)
         if extracted_folder.exists() and extracted_folder.is_dir():
@@ -944,7 +956,7 @@ class FileDownloader:
         write_checksum(
             chart_folder,
             task.md5,
-            archive_name,
+            original_archive_name,
             archive_size=archive_size,
             extracted_size=extracted_size,
             size_novideo=size_novideo
@@ -956,7 +968,7 @@ class FileDownloader:
         except Exception:
             pass  # Non-fatal
 
-        return True, ""
+        return True, display_archive_name, ""
 
     def _cleanup_partial_downloads(self, tasks: List[DownloadTask]) -> int:
         """
@@ -1021,7 +1033,7 @@ class FileDownloader:
         # Extractions spawn subprocesses that open many file handles
         extract_semaphore = threading.Semaphore(2)
 
-        def process_archive_limited(task: DownloadTask) -> Tuple[bool, str]:
+        def process_archive_limited(task: DownloadTask) -> Tuple[bool, str, str]:
             """Wrapper to limit concurrent extractions."""
             with extract_semaphore:
                 return self.process_archive(task)
@@ -1082,9 +1094,10 @@ class FileDownloader:
                             # Process archive if needed (run in executor to not block)
                             # Uses extract_semaphore to limit concurrent extractions
                             if task.is_archive:
-                                archive_success, archive_error = await loop.run_in_executor(
+                                archive_success, archive_name, archive_error = await loop.run_in_executor(
                                     None, process_archive_limited, task
                                 )
+
                                 if not archive_success:
                                     errors += 1
                                     if progress:
@@ -1095,9 +1108,11 @@ class FileDownloader:
                                 # Report archive completion
                                 if progress:
                                     # Get display name (strip _download_ prefix)
-                                    archive_name = task.local_path.name
-                                    if archive_name.startswith("_download_"):
-                                        archive_name = archive_name[10:]
+                                    if not archive_name:
+                                        archive_name = task.local_path.name
+                                        if archive_name.startswith("_download_"):
+                                            archive_name = archive_name[10:]
+                                
                                     progress.archive_completed(task.local_path, archive_name)
 
                             downloaded += 1
