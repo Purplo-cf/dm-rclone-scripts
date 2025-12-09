@@ -548,7 +548,7 @@ class FolderProgress(ProgressTracker):
 
         self.total_folders = len(folder_files)
 
-    def archive_completed(self, local_path: Path, archive_name: str):
+    def archive_completed(self, local_path: Path, archive_name: str, progress_key: str = ""):
         """Mark an archive as completed and print progress."""
         with self.lock:
             if self._closed:
@@ -559,9 +559,10 @@ class FolderProgress(ProgressTracker):
                 self.folder_progress[folder]["archives_completed"] += 1
 
             self.completed_charts += 1
-            self._print_item_complete(archive_name)
+            self.update_active_job_status("charts_completed", self.completed_charts)
+            self._print_item_complete(archive_name, progress_key)
 
-    def file_completed(self, local_path: Path, is_archive: bool = False) -> tuple[str, bool] | None:
+    def file_completed(self, local_path: Path, progress_key: str = "", is_archive: bool = False) -> tuple[str, bool] | None:
         """
         Mark a file as completed. Returns (folder_name, is_chart) if folder is now complete.
         For archives, returns None (they're reported via archive_completed instead).
@@ -571,6 +572,10 @@ class FolderProgress(ProgressTracker):
                 return None
 
             self.completed_files += 1
+
+            if progress_key:
+                self.finalize_item(progress_key)
+
             folder = str(local_path.parent)
 
             if folder in self.folder_progress:
@@ -580,11 +585,12 @@ class FolderProgress(ProgressTracker):
                 prog = self.folder_progress[folder]
                 if prog["completed"] >= prog["expected"] and prog["is_chart"]:
                     self.completed_charts += 1
+                    self.update_active_job_status("charts_completed", self.completed_charts)
                     return (local_path.parent.name, True)
 
             return None
 
-    def _print_item_complete(self, item_name: str):
+    def _print_item_complete(self, item_name: str, progress_key: str = ""):
         """Print progress when a chart or archive completes."""
         if self._closed:
             return
@@ -602,7 +608,7 @@ class FolderProgress(ProgressTracker):
         else:
             line = core
 
-        print(line)
+        self.write(line)
 
     def print_folder_complete(self, folder_name: str, is_chart: bool):
         """Print progress when a chart folder completes."""
@@ -859,6 +865,8 @@ class FileDownloader:
             else:
                 # Include song folder name for non-archive files
                 display_name = task.local_path.parent.name + "/" + display_name
+            
+            progress_key = task.md5
 
             with open(task.local_path, "wb") as f:
                 async for chunk in response.content.iter_chunked(self.chunk_size):
@@ -874,7 +882,7 @@ class FileDownloader:
                                 last_progress_time = now
                                 progress_shown = True
                                 
-                                progress_tracker.display_update(display_name, downloaded_bytes, total_size)
+                                progress_tracker.locked_display_update(progress_key, display_name, downloaded_bytes, total_size)
 
         return DownloadResult(
             success=True,
@@ -1026,6 +1034,9 @@ class FileDownloader:
             effective_workers = min(self.max_workers, 8)
         else:
             effective_workers = self.max_workers
+        
+        if progress:
+            progress.update_active_job_status("concurrent_downloads", effective_workers)
 
         semaphore = asyncio.Semaphore(effective_workers)
 
@@ -1087,7 +1098,7 @@ class FileDownloader:
                         except Exception as e:
                             errors += 1
                             if progress:
-                                progress.file_completed(task.local_path)
+                                progress.file_completed(task.local_path, task.md5)
                             continue
 
                         if result.success:
@@ -1101,8 +1112,8 @@ class FileDownloader:
                                 if not archive_success:
                                     errors += 1
                                     if progress:
-                                        progress.file_completed(task.local_path)
-                                        progress.write(f"  ERR: {task.local_path.parent.name} - {archive_error}")
+                                        progress.file_completed(task.local_path, task.md5)
+                                        progress.locked_write(f"  ERR: {task.local_path.parent.name} - {archive_error}")
                                     continue
 
                                 # Report archive completion
@@ -1119,13 +1130,13 @@ class FileDownloader:
                             if progress:
                                 # For non-archive files, check if folder is complete
                                 if not task.is_archive:
-                                    completed_info = progress.file_completed(result.file_path)
+                                    completed_info = progress.file_completed(result.file_path, task.md5)
                                     if completed_info:
                                         folder_name, is_chart = completed_info
                                         progress.print_folder_complete(folder_name, is_chart)
                                 else:
                                     # Just mark file as completed (archive already reported)
-                                    progress.file_completed(result.file_path)
+                                    progress.file_completed(result.file_path, task.md5)
                         else:
                             errors += 1
                             # Track auth failures separately for better user guidance
@@ -1135,8 +1146,8 @@ class FileDownloader:
                             if result.retryable:
                                 retryable_tasks.append(task)
                             if progress:
-                                progress.file_completed(result.file_path)
-                                progress.write(f"  {result.message}")
+                                progress.file_completed(result.file_path, task.md5)
+                                progress.locked_write(f"  {result.message}")
 
                         if progress_callback:
                             progress_callback(result)
@@ -1172,9 +1183,7 @@ class FileDownloader:
         if show_progress:
             progress = FolderProgress(total_files=len(tasks), total_folders=0)
             progress.register_folders(tasks)
-            print(f"  Downloading {len(tasks)} files across {progress.total_charts} charts...")
-            print(f"  (max {self.max_workers} concurrent downloads, press ESC to cancel)")
-            print()
+            progress.display_new_job(total_files=len(tasks), total_charts=progress.total_charts)
 
         # Set up Ctrl+C handler for cancellation
         original_handler = None
@@ -1182,7 +1191,7 @@ class FileDownloader:
         def handle_cancel():
             if progress and not progress.cancelled:
                 progress.cancel()
-                print("\n  Cancelling downloads...")
+                progress.locked_write("\n  Cancelling downloads...")
 
         def handle_interrupt(signum, frame):
             handle_cancel()
