@@ -186,7 +186,7 @@ class ChartSyncer:
             except Exception as e:
                 errors += 1
                 if progress:
-                    progress.write(f"  ERR: {chart.name} post-sync failed: {e}")
+                    progress.locked_write(f"  ERR: {chart.name} post-sync failed: {e}")
 
         return downloaded, errors
 

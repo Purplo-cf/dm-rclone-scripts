@@ -363,7 +363,7 @@ def get_folder_size(folder_path: Path) -> int:
     return total
 
 
-def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str]:
+def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str, str]:
     """
     Extract archive using Python libraries.
 
@@ -372,30 +372,33 @@ def extract_archive(archive_path: Path, dest_folder: Path) -> Tuple[bool, str]:
     - 7z: py7zr
     - RAR: rarfile with bundled UnRAR library
 
-    Returns (success, error_message).
+    Returns (success, extracted_folder, error_message).
     """
     ext = archive_path.suffix.lower()
     try:
         if ext == ".zip":
             with zipfile.ZipFile(archive_path, 'r') as zf:
+                first_extracted_member = zf.namelist()[0] if zf.namelist() else ""
                 zf.extractall(dest_folder)
-            return True, ""
+            return True, first_extracted_member,""
         elif ext == ".7z":
             if not HAS_7Z:
-                return False, "py7zr library not available"
+                return False, "", "py7zr library not available"
             with py7zr.SevenZipFile(archive_path, 'r') as sz:
+                first_extracted_member = sz.getnames()[0] if sz.getnames() else ""
                 sz.extractall(dest_folder)
-            return True, ""
+            return True, first_extracted_member, ""
         elif ext == ".rar":
             if not HAS_RAR_LIB:
-                return False, "rarfile library not available"
+                return False, "", "rarfile library not available"
             with rarfile.RarFile(str(archive_path)) as rf:
+                first_extracted_member = rf.namelist()[0] if rf.namelist() else ""
                 rf.extractall(str(dest_folder))
-            return True, ""
+            return True, first_extracted_member, ""
         else:
-            return False, f"Unsupported archive format: {ext}"
+            return False, "", f"Unsupported archive format: {ext}"
     except Exception as e:
-        return False, str(e)
+        return False, "", str(e)
 
 
 def delete_video_files(folder_path: Path) -> int:
@@ -496,7 +499,7 @@ class FolderProgress(ProgressTracker):
 
         self.total_folders = len(folder_files)
 
-    def archive_completed(self, local_path: Path, archive_name: str):
+    def archive_completed(self, local_path: Path, archive_name: str, progress_key: str = ""):
         """Mark an archive as completed and print progress."""
         with self.lock:
             if self._closed:
@@ -507,9 +510,10 @@ class FolderProgress(ProgressTracker):
                 self.folder_progress[folder]["archives_completed"] += 1
 
             self.completed_charts += 1
-            self._print_item_complete(archive_name)
+            self.update_active_job_status("charts_completed", self.completed_charts)
+            self._print_item_complete(archive_name, progress_key)
 
-    def file_completed(self, local_path: Path) -> tuple[str, bool] | None:
+    def file_completed(self, local_path: Path, progress_key: str = "", is_archive: bool = False) -> tuple[str, bool] | None:
         """
         Mark a file as completed. Returns (folder_name, is_chart) if folder is now complete.
         For archives, returns None (they're reported via archive_completed instead).
@@ -519,6 +523,10 @@ class FolderProgress(ProgressTracker):
                 return None
 
             self.completed_files += 1
+
+            if progress_key:
+                self.finalize_item(progress_key)
+
             folder = str(local_path.parent)
 
             if folder in self.folder_progress:
@@ -528,11 +536,12 @@ class FolderProgress(ProgressTracker):
                 prog = self.folder_progress[folder]
                 if prog["completed"] >= prog["expected"] and prog["is_chart"]:
                     self.completed_charts += 1
+                    self.update_active_job_status("charts_completed", self.completed_charts)
                     return (local_path.parent.name, True)
 
             return None
 
-    def _print_item_complete(self, item_name: str):
+    def _print_item_complete(self, item_name: str, progress_key: str = ""):
         """Print progress when a chart or archive completes."""
         if self._closed:
             return
@@ -550,7 +559,7 @@ class FolderProgress(ProgressTracker):
         else:
             line = core
 
-        print(line)
+        self.write(line)
 
     def print_folder_complete(self, folder_name: str, is_chart: bool):
         """Print progress when a chart folder completes."""
@@ -800,8 +809,14 @@ class FileDownloader:
 
             # Get display name (strip _download_ prefix if present)
             display_name = task.local_path.name
+
             if display_name.startswith("_download_"):
                 display_name = display_name[10:]
+            else:
+                # Include song folder name for non-archive files
+                display_name = task.local_path.parent.name + "/" + display_name
+            
+            progress_key = task.md5
 
             with open(task.local_path, "wb") as f:
                 async for chunk in response.content.iter_chunked(self.chunk_size):
@@ -815,10 +830,9 @@ class FileDownloader:
                             elapsed = now - download_start
                             if elapsed >= time_threshold and now - last_progress_time >= progress_interval:
                                 last_progress_time = now
-                                pct = (downloaded_bytes / total_size * 100) if total_size > 0 else 0
-                                size_mb = downloaded_bytes / (1024 * 1024)
-                                total_mb = total_size / (1024 * 1024)
-                                progress_tracker.write(f"  ↓ {display_name}: {size_mb:.0f}/{total_mb:.0f} MB ({pct:.0f}%)")
+                                progress_shown = True
+                                
+                                progress_tracker.locked_display_update(progress_key, display_name, downloaded_bytes, total_size)
 
         return DownloadResult(
             success=True,
@@ -827,7 +841,7 @@ class FileDownloader:
             bytes_downloaded=downloaded_bytes,
         )
 
-    def process_archive(self, task: DownloadTask) -> Tuple[bool, str]:
+    def process_archive(self, task: DownloadTask) -> Tuple[bool, str, str]:
         """
         Process a downloaded archive: extract, write checksum, delete videos, cleanup.
 
@@ -835,20 +849,19 @@ class FileDownloader:
             task: The completed DownloadTask (is_archive should be True)
 
         Returns:
-            (success, error_message)
+            (success, display_archive_name, error_message)
         """
         archive_path = task.local_path
         chart_folder = archive_path.parent
 
         # Determine extracted folder name (archive name without extension)
-        archive_name = archive_path.name.replace("_download_", "", 1)
-        archive_stem = Path(archive_name).stem
-        extracted_folder = chart_folder / archive_stem
+        original_archive_name = archive_path.name.replace("_download_", "", 1)
+        archive_stem = Path(original_archive_name).stem
 
         # Rename archive to remove _download_ prefix BEFORE extraction
         # This ensures unar/7z create folders with the correct name
         if archive_path.name.startswith("_download_"):
-            clean_archive_path = chart_folder / archive_name
+            clean_archive_path = chart_folder / original_archive_name
             try:
                 archive_path.rename(clean_archive_path)
                 archive_path = clean_archive_path
@@ -862,9 +875,18 @@ class FileDownloader:
         size_before = get_folder_size(chart_folder)
 
         # Extract archive
-        success, error = extract_archive(archive_path, chart_folder)
+        success, extracted_folder_name, error = extract_archive(archive_path, chart_folder)
         if not success:
-            return False, f"Extract failed: {error}"
+            return False, "", f"Extract failed: {error}"
+        
+        # Determine extracted folder path
+        if extracted_folder_name:
+            archive_stem = extracted_folder_name
+            display_archive_name = f"{extracted_folder_name} - {original_archive_name}"
+        else:
+            display_archive_name = original_archive_name
+
+        extracted_folder = chart_folder / archive_stem
 
         # Measure size AFTER extraction (before video removal)
         if extracted_folder.exists() and extracted_folder.is_dir():
@@ -892,7 +914,7 @@ class FileDownloader:
         write_checksum(
             chart_folder,
             task.md5,
-            archive_name,
+            original_archive_name,
             archive_size=archive_size,
             extracted_size=extracted_size,
             size_novideo=size_novideo
@@ -904,7 +926,7 @@ class FileDownloader:
         except Exception:
             pass  # Non-fatal
 
-        return True, ""
+        return True, display_archive_name, ""
 
     def _cleanup_partial_downloads(self, tasks: List[DownloadTask]) -> int:
         """
@@ -962,13 +984,16 @@ class FileDownloader:
             effective_workers = min(self.max_workers, 8)
         else:
             effective_workers = self.max_workers
+        
+        if progress:
+            progress.update_active_job_status("concurrent_downloads", effective_workers)
 
         semaphore = asyncio.Semaphore(effective_workers)
 
         # Limit extraction concurrency to prevent "too many open files" errors
         extract_semaphore = threading.Semaphore(2)
 
-        def process_archive_limited(task: DownloadTask) -> Tuple[bool, str]:
+        def process_archive_limited(task: DownloadTask) -> Tuple[bool, str, str]:
             """Wrapper to limit concurrent extractions."""
             with extract_semaphore:
                 return self.process_archive(task)
@@ -1022,42 +1047,45 @@ class FileDownloader:
                         except Exception as e:
                             errors += 1
                             if progress:
-                                progress.file_completed(task.local_path)
+                                progress.file_completed(task.local_path, task.md5)
                             continue
 
                         if result.success:
                             # Process archive if needed (run in executor to not block)
                             # Uses extract_semaphore to limit concurrent extractions
                             if task.is_archive:
-                                archive_success, archive_error = await loop.run_in_executor(
+                                archive_success, archive_name, archive_error = await loop.run_in_executor(
                                     None, process_archive_limited, task
                                 )
+
                                 if not archive_success:
                                     errors += 1
                                     if progress:
-                                        progress.file_completed(task.local_path)
-                                        progress.write(f"  ERR: {task.local_path.parent.name} - {archive_error}")
+                                        progress.file_completed(task.local_path, task.md5)
+                                        progress.locked_write(f"  ERR: {task.local_path.parent.name} - {archive_error}")
                                     continue
 
                                 # Report archive completion
                                 if progress:
                                     # Get display name (strip _download_ prefix)
-                                    archive_name = task.local_path.name
-                                    if archive_name.startswith("_download_"):
-                                        archive_name = archive_name[10:]
+                                    if not archive_name:
+                                        archive_name = task.local_path.name
+                                        if archive_name.startswith("_download_"):
+                                            archive_name = archive_name[10:]
+                                
                                     progress.archive_completed(task.local_path, archive_name)
 
                             downloaded += 1
                             if progress:
                                 # For non-archive files, check if folder is complete
                                 if not task.is_archive:
-                                    completed_info = progress.file_completed(result.file_path)
+                                    completed_info = progress.file_completed(result.file_path, task.md5)
                                     if completed_info:
                                         folder_name, is_chart = completed_info
                                         progress.print_folder_complete(folder_name, is_chart)
                                 else:
                                     # Just mark file as completed (archive already reported)
-                                    progress.file_completed(result.file_path)
+                                    progress.file_completed(result.file_path, task.md5)
                         else:
                             errors += 1
                             # Track auth failures separately for better user guidance
@@ -1067,8 +1095,8 @@ class FileDownloader:
                             if result.retryable:
                                 retryable_tasks.append(task)
                             if progress:
-                                progress.file_completed(result.file_path)
-                                progress.write(f"  {result.message}")
+                                progress.file_completed(result.file_path, task.md5)
+                                progress.locked_write(f"  {result.message}")
 
                         if progress_callback:
                             progress_callback(result)
@@ -1104,9 +1132,7 @@ class FileDownloader:
         if show_progress:
             progress = FolderProgress(total_files=len(tasks), total_folders=0)
             progress.register_folders(tasks)
-            print(f"  Downloading {len(tasks)} files across {progress.total_charts} charts...")
-            print(f"  (max {self.max_workers} concurrent downloads, press ESC to cancel)")
-            print()
+            progress.display_new_job(total_files=len(tasks), total_charts=progress.total_charts)
 
         # Set up Ctrl+C handler for cancellation
         original_handler = None
@@ -1114,7 +1140,7 @@ class FileDownloader:
         def handle_cancel():
             if progress and not progress.cancelled:
                 progress.cancel()
-                print("\n  Cancelling downloads...")
+                progress.locked_write("\n  Cancelling downloads...")
 
         def handle_interrupt(signum, frame):
             handle_cancel()
